@@ -1,0 +1,149 @@
+## multi-group test for selected genes ##
+# R CMD BATCH --no-save --no-restore  '--args subInd=1:100' Kernel_genes.r
+argLs <- commandArgs(TRUE)
+if(length(argLs) == 0){
+	stop("Please specify --args subInd=<vector>")
+} else {
+	for(i in 1:length(argLs)){
+		eval(parse(text=argLs[[i]]))
+	}
+}
+
+setwd("/home/yz32/project/nhp_development/mapToRheMac8/expression/analysis/TempShift")
+count0 <- read.table("/ycga-gpfs/project/ysm/sestan/yz32/nhp_development/mapToRheMac8/expression/analysis/QC/simFiltered.geneCount_exon_passQC.txt", as.is=TRUE, header=TRUE)
+phe <- read.csv("/ycga-gpfs/project/ysm/sestan/yz32/nhp_development/mapToRheMac8/expression/analysis/QC/pheno_passQC_withPeriod.csv", as.is=TRUE)
+
+rawCount <- count0[,-(1:5)]
+rownames(rawCount) <- count0[,1]
+
+rawRPKM <- log2(sweep(sweep(rawCount, 2, colSums(rawCount), FUN="/"), 1, count0$Length, FUN="/")*10^9 + 1)
+
+ncxRegOrder <- c("MFC","OFC","DFC","VFC","M1C","S1C","IPC","A1C","STC","ITC","V1C") # "HIP","AMY","STR","MD","CBC"
+
+selExpr <- t(rawRPKM[subInd, phe$Species=="Human"])
+hPhe <- phe[phe$Species=="Human",]
+
+regLs <- c("DFC", "MFC", "OFC", "VFC", "M1C", "S1C", "IPC", "A1C", "STC", "ITC", "V1C")
+expLs <- lapply(regLs, function(reg) {
+	selExpr[hPhe$Region==reg, ]
+})
+names(expLs) <- regLs
+
+pheLs <- lapply(regLs, function(reg) {
+	hPhe[hPhe$Region==reg, ]
+})
+names(pheLs) <- regLs
+
+xLs <- lapply(regLs, function(reg) {
+	log2(hPhe$Days[hPhe$Region==reg])
+})
+names(xLs) <- regLs
+
+orderedSelExpr <- do.call(rbind, expLs)
+orderedPhe <- do.call(rbind, pheLs)
+
+library(doParallel)
+library(TempShift)
+cl <- makeCluster(20)
+registerDoParallel(cl)
+ncxModelLs <- foreach(i=1:ncol(orderedSelExpr), .errorhandling='pass', .packages="TempShift") %dopar% {
+	yLs <- lapply(expLs, function(m){m[,i]})
+	gModLs <- fitAllModels(xLs, yLs, KernelPar0=c(l=10, sigmaF=5, sigma=1), lowerDTs=rep(-5, (length(xLs)-1)), upperDTs=rep(5, (length(xLs)-1)))
+
+}
+names(ncxModelLs) <- colnames(orderedSelExpr)
+save(ncxModelLs, file=paste("h_ncxModelLs_", subInd[1], "-", subInd[length(subInd)], ".RData", sep=""))
+
+#######################################################################################################
+#######################################################################################################
+parameterMat <- t(sapply(ncxModelLs, function(gModLs) {
+	if (!any(grepl("error", class(gModLs)))) {
+		c(Independence=gModLs$IndependenceModel$Par, Shift=gModLs$ShiftModel$Par)
+	} else {
+		rep(NA, 16)
+	}
+}))
+
+LLK <- t(sapply(ncxModelLs, function(mod) {
+	if (!any(grepl("error", class(mod)))) {
+		IndLLK <- sum(sapply(mod$IndependenceModel$Model, function(l) {
+			l$Fitted$LogLik 
+		}))
+		ShiftLLK <- mod$ShiftModel$Model$Fitted$LogLik
+		NoShiftLLK <- mod$NoShiftModel$Model$Fitted$LogLik
+		return(c(Independence=IndLLK, Shift=ShiftLLK, NoShift=NoShiftLLK))
+	} else {
+		return(rep(NA, 3))
+	}
+}))
+rownames(LLK) <- colnames(orderedSelExpr)
+
+dTMat <- sapply(ncxModelLs, function(mod) {
+	if (!any(grepl("error", class(mod)))) {
+		mod$ShiftModel$Par[grep("dT", names(mod$ShiftModel$Par))]
+	} else {
+		rep(NA, 10)
+	}
+})
+colnames(dTMat) <- colnames(orderedSelExpr)
+
+LLR <- cbind(LLRShape=LLK[,"Shift"]-LLK[,"Independence"], LLRShift=LLK[,"Shift"]-LLK[,"NoShift"])
+
+write.csv(parameterMat, paste("h_parameterMat_", subInd[1], "-", subInd[length(subInd)], ".csv", sep=""))
+write.csv(dTMat, paste("h_dTMat_", subInd[1], "-", subInd[length(subInd)], ".csv", sep=""))
+write.csv(LLR, paste("h_LLR_", subInd[1], "-", subInd[length(subInd)], ".csv", sep=""))
+
+meanMatLs <- lapply(c("IndependenceModel","ShiftModel","NoShiftModel"), function(modType) {
+		if (modType=="IndependenceModel") {
+			t(sapply(ncxModelLs, function(gModLs) {
+				if (!any(grepl("error", class(gModLs)))) { 
+					do.call(c, lapply(gModLs[[modType]]$Model, function(regMod) {
+						regMod$Fitted$Mean[,1]}))
+				} else{
+					rep(NA, nrow(orderedSelExpr))
+				}
+			}))
+		} else {
+			t(sapply(ncxModelLs, function(gModLs) {
+				if (!any(grepl("error", class(gModLs)))) {
+					gModLs[[modType]]$Model$Fitted$Mean[,1]
+				} else {
+					rep(NA, nrow(orderedSelExpr))
+				}
+			}))
+		}
+})
+names(meanMatLs) <- names(ncxModelLs[[1]])
+
+varMatLs <- lapply(names(ncxModelLs[[1]]), function(modType) {
+		if (modType=="IndependenceModel") {
+			t(sapply(ncxModelLs, function(gModLs) {
+				if (!any(grepl("error", class(gModLs)))) { 
+					do.call(c, lapply(gModLs[[modType]]$Model, function(regMod) {
+						diag(regMod$Fitted$Variance)})) + (gModLs[[modType]]$Par["sigma"])^2
+				} else{
+					rep(NA, nrow(orderedSelExpr))
+				}
+			}))
+		} else if(modType=="NoShiftModel") {
+			t(sapply(ncxModelLs, function(gModLs) {
+				if (!any(grepl("error", class(gModLs)))) {
+					diag(gModLs[[modType]]$Model$Fitted$Variance) + (gModLs$ShiftModel$Par["sigma"])^2
+				} else {
+					rep(NA, nrow(orderedSelExpr))
+				}
+			}))
+		} else {
+			t(sapply(ncxModelLs, function(gModLs) {
+				if (!any(grepl("error", class(gModLs)))) {
+					diag(gModLs[[modType]]$Model$Fitted$Variance) + (gModLs$ShiftModel$Par["sigma"])^2
+				} else {
+					rep(NA, nrow(orderedSelExpr))
+				}
+			}))
+		}
+})
+names(varMatLs) <- names(ncxModelLs[[1]])
+
+save(parameterMat, LLK, LLR, meanMatLs, varMatLs, file=paste("hNcx_result_summary_", subInd[1], "-", subInd[length(subInd)], ".RData", sep=""))
+
