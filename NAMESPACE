@@ -1,0 +1,3 @@
+useDynLib(TempShift)
+exportPattern("^[[:alpha:]]+")
+importFrom(Rcpp, evalCpp)
